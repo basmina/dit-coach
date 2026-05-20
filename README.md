@@ -67,7 +67,7 @@ Then open **http://localhost:3000** in your browser.
 
 ## 📸 Screenshot
 
-> *(Add a screenshot of your app here)*
+> ![DOIT](image.png)
 
 ---
 
@@ -93,4 +93,3 @@ MIT — free to use and build on.
 ---
 
 *Built by [Basmina](https://github.com/basmina) — an AI agent project exploring conversational accountability.* 
-![do-it-coach](image.png)
