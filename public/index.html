@@ -99,37 +99,74 @@
     }
   }
 
-  async function sendMessage() {
-    const input = document.getElementById("user-input");
-    const btn = document.getElementById("send-btn");
-    const text = input.value.trim();
-    if (!text) return;
+async function sendMessage() {
+  const input = document.getElementById("user-input");
+  const btn = document.getElementById("send-btn");
+  const text = input.value.trim();
+  if (!text) return;
 
-    input.value = "";
-    btn.disabled = true;
-    addMessage("user", text);
-    messages.push({ role: "user", content: text });
+  input.value = "";
+  btn.disabled = true;
+  addMessage("user", text);
+  messages.push({ role: "user", content: text });
 
-    const typing = addMessage("coach typing", "Coach is thinking...");
+  // Remove typing indicator, create empty bubble to fill live
+  const typing = addMessage("coach typing", "Coach is thinking...");
 
-    try {
-      const res = await fetch("/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages })
-      });
-      const data = await res.json();
-      typing.remove();
-      addMessage("coach", data.reply);
-      messages.push({ role: "assistant", content: data.reply });
-    } catch {
-      typing.remove();
-      addMessage("coach", "Something went wrong. Try again.");
+  try {
+    const res = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages })
+    });
+
+    typing.remove();
+
+    // Create empty coach bubble — tokens will appear inside it
+    const bubble = addMessage("coach", "");
+    let fullReply = "";
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value);
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop(); // hold incomplete chunk for next iteration
+
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.replace("data: ", "").trim();
+        if (data === "[DONE]") break;
+
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.token) {
+            fullReply += parsed.token;
+            bubble.textContent = fullReply; // update bubble live ✨
+            document.getElementById("chat").scrollTop = document.getElementById("chat").scrollHeight;
+          }
+          if (parsed.error) {
+            bubble.textContent = parsed.error;
+          }
+        } catch (_) {}
+      }
     }
 
-    btn.disabled = false;
-    input.focus();
+    messages.push({ role: "assistant", content: fullReply });
+
+  } catch {
+    typing.remove();
+    addMessage("coach", "Something went wrong. Try again.");
   }
+
+  btn.disabled = false;
+  input.focus();
+}
 </script>
 </body>
 </html> 
