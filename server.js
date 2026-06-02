@@ -67,7 +67,8 @@ app.post("/chat", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
-        max_tokens: 1000,
+        max_tokens: 200,
+        tempearture: 0.7,
         system: getSystemPrompt(),
         messages: messages,
         stream: true,            // 2. Tell Claude to stream
