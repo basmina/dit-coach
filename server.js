@@ -35,6 +35,11 @@ Never write long paragraphs. Use line breaks. Be human.`;
 app.post("/chat", async (req, res) => {
   const { messages } = req.body;
 
+  // 1. SSE headers — keeps connection open
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -48,30 +53,53 @@ app.post("/chat", async (req, res) => {
         max_tokens: 1000,
         system: getSystemPrompt(),
         messages: messages,
+        stream: true,            // 2. Tell Claude to stream
       }),
     });
 
-    const data = await response.json();
-    console.log("API response:", JSON.stringify(data, null, 2));
+    let fullReply = "";
 
-    if (data.error) {
-      return res.status(500).json({ reply: `API Error: ${data.error.message}` });
+    // 3. Read the stream chunk by chunk
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      const lines = chunk.split("\n").filter(line => line.startsWith("data:"));
+
+      for (const line of lines) {
+        const jsonStr = line.replace("data: ", "").trim();
+        if (jsonStr === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.type === "content_block_delta") {
+            const token = parsed.delta.text;
+            fullReply += token;
+            // 4. Send each token to the browser immediately
+            res.write(`data: ${JSON.stringify({ token })}\n\n`);
+          }
+        } catch (_) {}
+      }
     }
 
-    if (!data.content || !data.content[0]) {
-      return res.status(500).json({ reply: "No response from API. Check terminal for details." });
-    }
-
-    const reply = data.content[0].text;
-
-    // Auto-save check-in summary
+    // 5. Save check-in history (same as before, just moved here)
     const lastUserMsg = messages[messages.length - 1].content;
-    checkInHistory.push(`[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${reply.slice(0, 80)}...`);
+    checkInHistory.push(
+      `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${fullReply.slice(0, 80)}...`
+    );
 
-    res.json({ reply });
+    // 6. Signal stream is done
+    res.write(`data: [DONE]\n\n`);
+    res.end();
+
   } catch (err) {
     console.error("Full error:", err);
-    res.status(500).json({ reply: "Something went wrong. Check your terminal." });
+    res.write(`data: ${JSON.stringify({ error: "Something went wrong." })}\n\n`);
+    res.end();
   }
 });
 
