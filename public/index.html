@@ -55,8 +55,18 @@
   let goals = [];
 
   // Start with a welcome message
-  window.onload = () => {
+window.onload = async () => {
     addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
+    
+    // load saved goals from MongoDB
+    try {
+      const res = await fetch("/goals");
+      const data = await res.json();
+      if (data.goals && data.goals.length > 0) {
+        goals = data.goals;
+        renderGoals();
+      }
+    } catch (_) {}
   };
 
   function addGoal() {
