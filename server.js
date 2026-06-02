@@ -1,5 +1,6 @@
 const express = require("express");
 const path = require("path");
+const { MongoClient } = require("mongodb");
 require("dotenv").config();
 
 const app = express();
@@ -9,12 +10,22 @@ app.use(express.static("public"));
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "✅ Yes" : "❌ Missing");
 
-// Store goals and history in memory
-let userGoals = [];
-let checkInHistory = [];
+let db, goalsCollection, checkinsCollection;
 
-// System prompt for the coach
-function getSystemPrompt() {
+async function connectDB() {
+  const mongoClient = new MongoClient(process.env.MONGODB_URI);
+  await mongoClient.connect();
+  db = mongoClient.db("doitcoach");
+  goalsCollection = db.collection("goals");
+  checkinsCollection = db.collection("checkins");
+  console.log("MongoDB connected ✅");
+}
+
+async function getSystemPrompt() {
+  const goals = await goalsCollection.find().toArray();
+  const checkins = await checkinsCollection
+    .find().sort({ _id: -1 }).limit(5).toArray();
+
   return `You are DoIt, a personal accountability coach.
 You are warm but direct. You never let excuses slide unchallenged.
 You celebrate wins with genuine enthusiasm.
@@ -25,7 +36,7 @@ RESPONSE RULES:
 - No bullet points or bold text
 - Always end with a question or a direct challenge
 - Never open with "I" or "Great!"
-- "Never use asterisks or markdown formatting"
+- Never use asterisks or markdown formatting
 
 EXAMPLES:
 User: "I didn't go to the gym today"
@@ -42,17 +53,16 @@ Coach: "You said that yesterday.
 What's one thing you can do in the next 10 minutes?"
 
 USER GOALS:
-${userGoals.length > 0 ? userGoals.map((g, i) => `${i+1}. ${g}`).join("\n") : "Not set yet. Ask them what they want to achieve."}
+${goals.length > 0 ? goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n") : "Not set yet. Ask them what they want to achieve."}
 
 RECENT CHECK-INS:
-${checkInHistory.length > 0 ? checkInHistory.slice(-5).join("\n") : "No check-ins yet."}`;
+${checkins.length > 0 ? checkins.map(c => c.entry).reverse().join("\n") : "No check-ins yet."}`;
 }
 
 // Chat endpoint
 app.post("/chat", async (req, res) => {
   const { messages } = req.body;
 
-  // 1. SSE headers — keeps connection open
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -67,16 +77,15 @@ app.post("/chat", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
-        max_tokens: 1000,
-        system: getSystemPrompt(),
+        max_tokens: 200,
+        system: await getSystemPrompt(),
         messages: messages,
-        stream: true,            // 2. Tell Claude to stream
+        stream: true,
       }),
     });
 
     let fullReply = "";
 
-    // 3. Read the stream chunk by chunk
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
@@ -96,20 +105,19 @@ app.post("/chat", async (req, res) => {
           if (parsed.type === "content_block_delta") {
             const token = parsed.delta.text;
             fullReply += token;
-            // 4. Send each token to the browser immediately
             res.write(`data: ${JSON.stringify({ token })}\n\n`);
           }
         } catch (_) {}
       }
     }
 
-    // 5. Save check-in history (same as before, just moved here)
+    // save checkin to MongoDB
     const lastUserMsg = messages[messages.length - 1].content;
-    checkInHistory.push(
-      `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${fullReply.slice(0, 80)}...`
-    );
+    await checkinsCollection.insertOne({
+      entry: `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${fullReply.slice(0, 80)}...`,
+      createdAt: new Date()
+    });
 
-    // 6. Signal stream is done
     res.write(`data: [DONE]\n\n`);
     res.end();
 
@@ -121,17 +129,31 @@ app.post("/chat", async (req, res) => {
 });
 
 // Save goals endpoint
-app.post("/goals", (req, res) => {
-  userGoals = req.body.goals;
+app.post("/goals", async (req, res) => {
+  await goalsCollection.deleteMany({});
+  const goalDocs = req.body.goals.map(goal => ({
+    goal,
+    createdAt: new Date()
+  }));
+  if (goalDocs.length > 0) {
+    await goalsCollection.insertMany(goalDocs);
+  }
   res.json({ success: true });
 });
 
 // Get goals endpoint
-app.get("/goals", (req, res) => {
-  res.json({ goals: userGoals });
+app.get("/goals", async (req, res) => {
+  const goals = await goalsCollection.find().toArray();
+  res.json({ goals: goals.map(g => g.goal) });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`DoIt Coach running on port ${PORT}`);
+// start server only after DB is connected
+connectDB().then(() => {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`DoIt Coach running on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error("Failed to connect to MongoDB:", err);
+  process.exit(1);
 });
