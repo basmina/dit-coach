@@ -85,16 +85,6 @@ window.onload = async () => {
   } catch (_) {}
 };
 
-  function addGoal() {
-    const input = document.getElementById("goal-input");
-    const val = input.value.trim();
-    if (!val) return;
-    goals.push(val);
-    input.value = "";
-    renderGoals();
-    saveGoals();
-  }
-
   function renderGoals() {
     const display = document.getElementById("goals-display");
     display.innerHTML = goals.map(g => `<span class="goal-tag">🎯 ${g}</span>`).join("");
