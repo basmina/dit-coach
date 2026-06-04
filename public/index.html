@@ -35,6 +35,9 @@
 <header>
   <h1>⚡ DoIt Coach</h1>
   <span>Your personal accountability coach</span>
+  <div id="user-area">
+  <a href="/auth/logout" style="color:#888;font-size:0.8rem;text-decoration:none;">Logout</a>
+</div>
 </header>
 
 <div id="goal-bar">
@@ -53,21 +56,40 @@
 <script>
   let messages = [];
   let goals = [];
-
-  // Start with a welcome message
 window.onload = async () => {
-    addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
-    
-    // load saved goals from MongoDB
-    try {
-      const res = await fetch("/goals");
-      const data = await res.json();
-      if (data.goals && data.goals.length > 0) {
-        goals = data.goals;
-        renderGoals();
-      }
-    } catch (_) {}
-  };
+  // check if user is logged in
+  const authRes = await fetch("/auth/user");
+  const authData = await authRes.json();
+
+  if (!authData.user) {
+    // not logged in — show login screen
+    document.getElementById("goal-bar").style.display = "none";
+    document.getElementById("input-area").style.display = "none";
+    document.getElementById("chat").innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:20px;">
+        <p style="color:#888;font-size:1rem;">Sign in to start your accountability journey</p>
+        <a href="/auth/google" style="background:#00e5a0;color:#000;padding:12px 28px;border-radius:8px;font-weight:700;text-decoration:none;font-size:1rem;">
+          Sign in with Google
+        </a>
+      </div>`;
+    return;
+  }
+
+  // logged in — show user name
+  document.querySelector("header span").textContent = `Hi ${authData.user.name.split(" ")[0]} 👋`;
+
+  addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
+
+  // load saved goals from MongoDB
+  try {
+    const res = await fetch("/goals");
+    const data = await res.json();
+    if (data.goals && data.goals.length > 0) {
+      goals = data.goals;
+      renderGoals();
+    }
+  } catch (_) {}
+};
 
   function addGoal() {
     const input = document.getElementById("goal-input");
