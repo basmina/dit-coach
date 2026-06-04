@@ -27,48 +27,6 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "✅ Yes" : "❌ Missing");
 
 let db, goalsCollection, checkinsCollection, usersCollection;
-// TEMP: test reminder endpoint — remove after testing
-app.get("/test-reminder", async (req, res) => {
-  try {
-    const users = await usersCollection.find({}).toArray();
-    const today = new Date().toLocaleDateString();
-    let sent = 0;
-
-    for (const user of users) {
-      const goals = await goalsCollection
-        .find({ userId: user.googleId }).toArray();
-
-      if (goals.length === 0) continue;
-
-      const goalList = goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n");
-
-      await transporter.sendMail({
-        from: `"DoIt Coach" <${process.env.GMAIL_ID}>`,
-        to: user.email,
-        subject: "DoIt Coach — daily check-in 👋",
-        text: `Hey ${user.name.split(" ")[0]},
-
-You haven't checked in today. Your coach is waiting.
-
-Your goals:
-${goalList}
-
-How did it go? Come back and tell your coach:
-https://dit-coach.onrender.com
-
-— DoIt Coach`
-      });
-
-      console.log(`Reminder sent to ${user.email}`);
-      sent++;
-    }
-
-    res.json({ success: true, emailsSent: sent });
-  } catch (err) {
-    console.error(err);
-    res.json({ error: err.message });
-  }
-});
 async function connectDB() {
   const mongoClient = new MongoClient(process.env.MONGODB_URI);
   await mongoClient.connect();
@@ -371,7 +329,34 @@ app.get("/goals", requireAuth, async (req, res) => {
   const goals = await goalsCollection.find({ userId }).toArray();
   res.json({ goals: goals.map(g => g.goal) });
 });
+app.get("/test-reminder", async (req, res) => {
+  try {
+    const users = await usersCollection.find({}).toArray();
+    let sent = 0;
 
+    for (const user of users) {
+      const goals = await goalsCollection
+        .find({ userId: user.googleId }).toArray();
+      if (goals.length === 0) continue;
+
+      const goalList = goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n");
+
+      await transporter.sendMail({
+        from: `"DoIt Coach" <${process.env.GMAIL_ID}>`,
+        to: user.email,
+        subject: "DoIt Coach — daily check-in 👋",
+        text: `Hey ${user.name.split(" ")[0]},\n\nYou haven't checked in today.\n\nYour goals:\n${goalList}\n\nhttps://dit-coach.onrender.com\n\n— DoIt Coach`
+      });
+
+      console.log(`Reminder sent to ${user.email}`);
+      sent++;
+    }
+    res.json({ success: true, emailsSent: sent });
+  } catch (err) {
+    console.error(err);
+    res.json({ error: err.message });
+  }
+});
 connectDB().then(() => {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
