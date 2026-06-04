@@ -56,9 +56,10 @@ window.onload = async () => {
   const authData = await authRes.json();
 
   if (!authData.user) {
-    // not logged in — show login screen
-    document.getElementById("goal-bar").style.display = "none";
-    document.getElementById("input-area").style.display = "none";
+const goalBar = document.getElementById("goal-bar");
+const inputArea = document.getElementById("input-area");
+if (goalBar) goalBar.style.display = "none";
+if (inputArea) inputArea.style.display = "none";
     document.getElementById("chat").innerHTML = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:20px;">
         <p style="color:#888;font-size:1rem;">Sign in to start your accountability journey</p>
