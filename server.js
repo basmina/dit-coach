@@ -1,5 +1,4 @@
 const express = require("express");
-const path = require("path");
 const { MongoClient } = require("mongodb");
 require("dotenv").config();
 
@@ -59,6 +58,57 @@ RECENT CHECK-INS:
 ${checkins.length > 0 ? checkins.map(c => c.entry).reverse().join("\n") : "No check-ins yet."}`;
 }
 
+// the tools Claude can call
+const tools = [
+  {
+    name: "save_goal",
+    description: "Save a new goal the user wants to achieve. Call this when the user clearly states a goal or something they want to work toward consistently.",
+    input_schema: {
+      type: "object",
+      properties: {
+        goal: {
+          type: "string",
+          description: "The goal exactly as the user described it"
+        }
+      },
+      required: ["goal"]
+    }
+  }
+];
+
+// run the tool Claude decided to call
+async function runTool(toolName, toolInput) {
+  if (toolName === "save_goal") {
+    await goalsCollection.insertOne({
+      goal: toolInput.goal,
+      createdAt: new Date()
+    });
+    console.log(`Goal saved via tool: ${toolInput.goal}`);
+    return `Goal saved: "${toolInput.goal}"`;
+  }
+  return "Tool not found";
+}
+
+// call Claude API (non-streaming) and return full response
+async function callClaude(messages) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      max_tokens: 200,
+      system: await getSystemPrompt(),
+      messages,
+      tools
+    })
+  });
+  return await response.json();
+}
+
 // Chat endpoint
 app.post("/chat", async (req, res) => {
   const { messages } = req.body;
@@ -68,53 +118,64 @@ app.post("/chat", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-5",
-        max_tokens: 200,
-        system: await getSystemPrompt(),
-        messages: messages,
-        stream: true,
-      }),
-    });
+    let currentMessages = [...messages];
+    let finalReply = "";
 
-    let fullReply = "";
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-
+    // agentic loop — keeps going until Claude stops calling tools
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const data = await callClaude(currentMessages);
 
-      const chunk = decoder.decode(value);
-      const lines = chunk.split("\n").filter(line => line.startsWith("data:"));
+      // check if Claude wants to call a tool
+      const toolUseBlock = data.content.find(b => b.type === "tool_use");
 
-      for (const line of lines) {
-        const jsonStr = line.replace("data: ", "").trim();
-        if (jsonStr === "[DONE]") continue;
+      if (toolUseBlock) {
+        // Claude decided to call a tool
+        console.log(`Tool called: ${toolUseBlock.name}`, toolUseBlock.input);
 
-        try {
-          const parsed = JSON.parse(jsonStr);
-          if (parsed.type === "content_block_delta") {
-            const token = parsed.delta.text;
-            fullReply += token;
-            res.write(`data: ${JSON.stringify({ token })}\n\n`);
+        // YOU run the tool
+        const toolResult = await runTool(toolUseBlock.name, toolUseBlock.input);
+
+        // notify frontend a goal was saved
+        if (toolUseBlock.name === "save_goal") {
+          res.write(`data: ${JSON.stringify({ goalSaved: toolUseBlock.input.goal })}\n\n`);
+        }
+
+        // add Claude's tool_use + your tool_result to messages
+        currentMessages = [
+          ...currentMessages,
+          { role: "assistant", content: data.content },
+          {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: toolUseBlock.id,
+              content: toolResult
+            }]
           }
-        } catch (_) {}
+        ];
+
+        // loop again — Claude will now reply to user
+        continue;
       }
+
+      // no tool call — Claude is replying with text
+      const textBlock = data.content.find(b => b.type === "text");
+      if (textBlock) {
+        finalReply = textBlock.text;
+        // stream it word by word so UI still feels live
+        const words = finalReply.split(" ");
+        for (const word of words) {
+          res.write(`data: ${JSON.stringify({ token: word + " " })}\n\n`);
+          await new Promise(r => setTimeout(r, 30));
+        }
+      }
+      break;
     }
 
-    // save checkin to MongoDB
+    // save checkin
     const lastUserMsg = messages[messages.length - 1].content;
     await checkinsCollection.insertOne({
-      entry: `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${fullReply.slice(0, 80)}...`,
+      entry: `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${finalReply.slice(0, 80)}...`,
       createdAt: new Date()
     });
 
@@ -128,7 +189,7 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// Save goals endpoint
+// Save goals endpoint (still works for the + Add Goal button)
 app.post("/goals", async (req, res) => {
   await goalsCollection.deleteMany({});
   const goalDocs = req.body.goals.map(goal => ({
@@ -147,7 +208,6 @@ app.get("/goals", async (req, res) => {
   res.json({ goals: goals.map(g => g.goal) });
 });
 
-// start server only after DB is connected
 connectDB().then(() => {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
