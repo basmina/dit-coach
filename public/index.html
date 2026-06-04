@@ -160,6 +160,10 @@ async function sendMessage() {
             bubble.textContent = fullReply; // update bubble live ✨
             document.getElementById("chat").scrollTop = document.getElementById("chat").scrollHeight;
           }
+          if (parsed.goalSaved) {
+            goals.push(parsed.goalSaved);
+            renderGoals();
+          }
           if (parsed.error) {
             bubble.textContent = parsed.error;
           }
