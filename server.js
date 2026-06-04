@@ -3,7 +3,7 @@ const { MongoClient } = require("mongodb");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 const cron = require("node-cron");
 require("dotenv").config();
 
@@ -11,22 +11,22 @@ const app = express();
 app.use(express.json());
 app.use(express.static("public"));
 
-// session middleware
 app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 } // 7 days
+  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
-// passport middleware
 app.use(passport.initialize());
 app.use(passport.session());
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const resend = new Resend(process.env.RESEND_API_KEY);
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "✅ Yes" : "❌ Missing");
 
 let db, goalsCollection, checkinsCollection, usersCollection;
+
 async function connectDB() {
   const mongoClient = new MongoClient(process.env.MONGODB_URI);
   await mongoClient.connect();
@@ -37,45 +37,12 @@ async function connectDB() {
   console.log("MongoDB connected ✅");
 }
 
-// email transporter
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  auth: {
-    user: process.env.GMAIL_ID,
-    pass: process.env.GMAIL_PASSWORD
-  }
-});
-
-// daily reminder — runs every day at 8pm IST (14:30 UTC)
-cron.schedule("30 14 * * *", async () => {
-  console.log("Running daily reminder check...");
-  try {
-    const users = await usersCollection.find({}).toArray();
-    const today = new Date().toLocaleDateString();
-
-    for (const user of users) {
-      // check if user has checked in today
-      const todayCheckin = await checkinsCollection.findOne({
-        userId: user.googleId,
-        entry: { $regex: today }
-      });
-
-      if (!todayCheckin) {
-        // no checkin today — get their goals
-        const goals = await goalsCollection
-          .find({ userId: user.googleId }).toArray();
-
-        if (goals.length === 0) continue; // skip users with no goals
-
-        const goalList = goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n");
-
-        await transporter.sendMail({
-          from: `"DoIt Coach" <${process.env.GMAIL_ID}>`,
-          to: user.email,
-          subject: "DoIt Coach — daily check-in 👋",
-          text: `Hey ${user.name.split(" ")[0]},
+async function sendReminderEmail(user, goalList) {
+  await resend.emails.send({
+    from: "DoIt Coach <onboarding@resend.dev>",
+    to: user.email,
+    subject: "DoIt Coach — daily check-in 👋",
+    text: `Hey ${user.name.split(" ")[0]},
 
 You haven't checked in today. Your coach is waiting.
 
@@ -86,8 +53,29 @@ How did it go? Come back and tell your coach:
 https://dit-coach.onrender.com
 
 — DoIt Coach`
-        });
+  });
+}
 
+// daily reminder — 8pm IST = 14:30 UTC
+cron.schedule("30 14 * * *", async () => {
+  console.log("Running daily reminder check...");
+  try {
+    const users = await usersCollection.find({}).toArray();
+    const today = new Date().toLocaleDateString();
+
+    for (const user of users) {
+      const todayCheckin = await checkinsCollection.findOne({
+        userId: user.googleId,
+        entry: { $regex: today }
+      });
+
+      if (!todayCheckin) {
+        const goals = await goalsCollection
+          .find({ userId: user.googleId }).toArray();
+        if (goals.length === 0) continue;
+
+        const goalList = goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n");
+        await sendReminderEmail(user, goalList);
         console.log(`Reminder sent to ${user.email}`);
       }
     }
@@ -95,14 +83,13 @@ https://dit-coach.onrender.com
     console.error("Reminder error:", err);
   }
 });
-// Google OAuth strategy
+
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
   callbackURL: "https://dit-coach.onrender.com/auth/google/callback"
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    // find or create user in MongoDB
     let user = await usersCollection.findOne({ googleId: profile.id });
     if (!user) {
       const result = await usersCollection.insertOne({
@@ -120,9 +107,7 @@ passport.use(new GoogleStrategy({
   }
 }));
 
-passport.serializeUser((user, done) => {
-  done(null, user.googleId);
-});
+passport.serializeUser((user, done) => done(null, user.googleId));
 
 passport.deserializeUser(async (googleId, done) => {
   try {
@@ -133,22 +118,15 @@ passport.deserializeUser(async (googleId, done) => {
   }
 });
 
-// auth routes
-app.get("/auth/google",
-  passport.authenticate("google", { scope: ["profile", "email"] })
-);
+app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
 
 app.get("/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
-  (req, res) => {
-    res.redirect("/");
-  }
+  (req, res) => res.redirect("/")
 );
 
 app.get("/auth/logout", (req, res) => {
-  req.logout(() => {
-    res.redirect("/");
-  });
+  req.logout(() => res.redirect("/"));
 });
 
 app.get("/auth/user", (req, res) => {
@@ -159,7 +137,6 @@ app.get("/auth/user", (req, res) => {
   }
 });
 
-// middleware to protect routes
 function requireAuth(req, res, next) {
   if (req.isAuthenticated()) return next();
   res.status(401).json({ error: "Please log in" });
@@ -219,11 +196,7 @@ const tools = [
 
 async function runTool(toolName, toolInput, userId) {
   if (toolName === "save_goal") {
-    await goalsCollection.insertOne({
-      goal: toolInput.goal,
-      userId,
-      createdAt: new Date()
-    });
+    await goalsCollection.insertOne({ goal: toolInput.goal, userId, createdAt: new Date() });
     console.log(`Goal saved for user ${userId}: ${toolInput.goal}`);
     return `Goal saved: "${toolInput.goal}"`;
   }
@@ -249,7 +222,6 @@ async function callClaude(messages, userId) {
   return await response.json();
 }
 
-// Chat endpoint — protected
 app.post("/chat", requireAuth, async (req, res) => {
   const { messages } = req.body;
   const userId = req.user.googleId;
@@ -268,22 +240,13 @@ app.post("/chat", requireAuth, async (req, res) => {
 
       if (toolUseBlock) {
         const toolResult = await runTool(toolUseBlock.name, toolUseBlock.input, userId);
-
         if (toolUseBlock.name === "save_goal") {
           res.write(`data: ${JSON.stringify({ goalSaved: toolUseBlock.input.goal })}\n\n`);
         }
-
         currentMessages = [
           ...currentMessages,
           { role: "assistant", content: data.content },
-          {
-            role: "user",
-            content: [{
-              type: "tool_result",
-              tool_use_id: toolUseBlock.id,
-              content: toolResult
-            }]
-          }
+          { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseBlock.id, content: toolResult }] }
         ];
         continue;
       }
@@ -317,7 +280,6 @@ app.post("/chat", requireAuth, async (req, res) => {
   }
 });
 
-// Goals endpoints — protected
 app.post("/goals", requireAuth, async (req, res) => {
   const userId = req.user.googleId;
   await goalsCollection.deleteMany({ userId });
@@ -331,25 +293,19 @@ app.get("/goals", requireAuth, async (req, res) => {
   const goals = await goalsCollection.find({ userId }).toArray();
   res.json({ goals: goals.map(g => g.goal) });
 });
+
+// test reminder endpoint — remove after testing
 app.get("/test-reminder", async (req, res) => {
   try {
     const users = await usersCollection.find({}).toArray();
     let sent = 0;
 
     for (const user of users) {
-      const goals = await goalsCollection
-        .find({ userId: user.googleId }).toArray();
+      const goals = await goalsCollection.find({ userId: user.googleId }).toArray();
       if (goals.length === 0) continue;
 
       const goalList = goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n");
-
-      await transporter.sendMail({
-        from: `"DoIt Coach" <${process.env.GMAIL_ID}>`,
-        to: user.email,
-        subject: "DoIt Coach — daily check-in 👋",
-        text: `Hey ${user.name.split(" ")[0]},\n\nYou haven't checked in today.\n\nYour goals:\n${goalList}\n\nhttps://dit-coach.onrender.com\n\n— DoIt Coach`
-      });
-
+      await sendReminderEmail(user, goalList);
       console.log(`Reminder sent to ${user.email}`);
       sent++;
     }
@@ -359,11 +315,10 @@ app.get("/test-reminder", async (req, res) => {
     res.json({ error: err.message });
   }
 });
+
 connectDB().then(() => {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`DoIt Coach running on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`DoIt Coach running on port ${PORT}`));
 }).catch(err => {
   console.error("Failed to connect to MongoDB:", err);
   process.exit(1);
