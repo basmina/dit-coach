@@ -35,9 +35,9 @@
 <header>
   <h1>⚡ DoIt Coach</h1>
   <span>Your personal accountability coach</span>
-  <div id="user-area">
-  <a href="/auth/logout" style="color:#888;font-size:0.8rem;text-decoration:none;">Logout</a>
-</div>
+  <div id="user-area" style="display:none;">
+    <a href="/auth/logout" style="color:#888;font-size:0.8rem;text-decoration:none;">Logout</a>
+  </div>
 </header>
 
 <div id="goal-bar">
@@ -77,7 +77,7 @@ window.onload = async () => {
 
   // logged in — show user name
   document.querySelector("header span").textContent = `Hi ${authData.user.name.split(" ")[0]} 👋`;
-
+  document.getElementById("user-area").style.display = "block";
   addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
 
   // load saved goals from MongoDB
