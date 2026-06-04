@@ -1,15 +1,30 @@
 const express = require("express");
 const { MongoClient } = require("mongodb");
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const session = require("express-session");
 require("dotenv").config();
 
 const app = express();
 app.use(express.json());
 app.use(express.static("public"));
 
+// session middleware
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 } // 7 days
+}));
+
+// passport middleware
+app.use(passport.initialize());
+app.use(passport.session());
+
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "✅ Yes" : "❌ Missing");
 
-let db, goalsCollection, checkinsCollection;
+let db, goalsCollection, checkinsCollection, usersCollection;
 
 async function connectDB() {
   const mongoClient = new MongoClient(process.env.MONGODB_URI);
@@ -17,13 +32,84 @@ async function connectDB() {
   db = mongoClient.db("doitcoach");
   goalsCollection = db.collection("goals");
   checkinsCollection = db.collection("checkins");
+  usersCollection = db.collection("users");
   console.log("MongoDB connected ✅");
 }
 
-async function getSystemPrompt() {
-  const goals = await goalsCollection.find().toArray();
+// Google OAuth strategy
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: "/auth/google/callback"
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    // find or create user in MongoDB
+    let user = await usersCollection.findOne({ googleId: profile.id });
+    if (!user) {
+      const result = await usersCollection.insertOne({
+        googleId: profile.id,
+        name: profile.displayName,
+        email: profile.emails[0].value,
+        photo: profile.photos[0].value,
+        createdAt: new Date()
+      });
+      user = { _id: result.insertedId, googleId: profile.id, name: profile.displayName, email: profile.emails[0].value };
+    }
+    return done(null, user);
+  } catch (err) {
+    return done(err, null);
+  }
+}));
+
+passport.serializeUser((user, done) => {
+  done(null, user.googleId);
+});
+
+passport.deserializeUser(async (googleId, done) => {
+  try {
+    const user = await usersCollection.findOne({ googleId });
+    done(null, user);
+  } catch (err) {
+    done(err, null);
+  }
+});
+
+// auth routes
+app.get("/auth/google",
+  passport.authenticate("google", { scope: ["profile", "email"] })
+);
+
+app.get("/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/" }),
+  (req, res) => {
+    res.redirect("/");
+  }
+);
+
+app.get("/auth/logout", (req, res) => {
+  req.logout(() => {
+    res.redirect("/");
+  });
+});
+
+app.get("/auth/user", (req, res) => {
+  if (req.isAuthenticated()) {
+    res.json({ user: { name: req.user.name, email: req.user.email, photo: req.user.photo } });
+  } else {
+    res.json({ user: null });
+  }
+});
+
+// middleware to protect routes
+function requireAuth(req, res, next) {
+  if (req.isAuthenticated()) return next();
+  res.status(401).json({ error: "Please log in" });
+}
+
+async function getSystemPrompt(userId) {
+  const goals = await goalsCollection.find({ userId }).toArray();
   const checkins = await checkinsCollection
-    .find().sort({ _id: -1 }).limit(5).toArray();
+    .find({ userId }).sort({ _id: -1 }).limit(5).toArray();
 
   return `You are DoIt, a personal accountability coach.
 You are warm but direct. You never let excuses slide unchallenged.
@@ -58,7 +144,6 @@ RECENT CHECK-INS:
 ${checkins.length > 0 ? checkins.map(c => c.entry).reverse().join("\n") : "No check-ins yet."}`;
 }
 
-// the tools Claude can call
 const tools = [
   {
     name: "save_goal",
@@ -66,31 +151,27 @@ const tools = [
     input_schema: {
       type: "object",
       properties: {
-        goal: {
-          type: "string",
-          description: "The goal exactly as the user described it"
-        }
+        goal: { type: "string", description: "The goal exactly as the user described it" }
       },
       required: ["goal"]
     }
   }
 ];
 
-// run the tool Claude decided to call
-async function runTool(toolName, toolInput) {
+async function runTool(toolName, toolInput, userId) {
   if (toolName === "save_goal") {
     await goalsCollection.insertOne({
       goal: toolInput.goal,
+      userId,
       createdAt: new Date()
     });
-    console.log(`Goal saved via tool: ${toolInput.goal}`);
+    console.log(`Goal saved for user ${userId}: ${toolInput.goal}`);
     return `Goal saved: "${toolInput.goal}"`;
   }
   return "Tool not found";
 }
 
-// call Claude API (non-streaming) and return full response
-async function callClaude(messages) {
+async function callClaude(messages, userId) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -101,7 +182,7 @@ async function callClaude(messages) {
     body: JSON.stringify({
       model: "claude-sonnet-4-5",
       max_tokens: 200,
-      system: await getSystemPrompt(),
+      system: await getSystemPrompt(userId),
       messages,
       tools
     })
@@ -109,9 +190,10 @@ async function callClaude(messages) {
   return await response.json();
 }
 
-// Chat endpoint
-app.post("/chat", async (req, res) => {
+// Chat endpoint — protected
+app.post("/chat", requireAuth, async (req, res) => {
   const { messages } = req.body;
+  const userId = req.user.googleId;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -121,26 +203,17 @@ app.post("/chat", async (req, res) => {
     let currentMessages = [...messages];
     let finalReply = "";
 
-    // agentic loop — keeps going until Claude stops calling tools
     while (true) {
-      const data = await callClaude(currentMessages);
-
-      // check if Claude wants to call a tool
+      const data = await callClaude(currentMessages, userId);
       const toolUseBlock = data.content.find(b => b.type === "tool_use");
 
       if (toolUseBlock) {
-        // Claude decided to call a tool
-        console.log(`Tool called: ${toolUseBlock.name}`, toolUseBlock.input);
+        const toolResult = await runTool(toolUseBlock.name, toolUseBlock.input, userId);
 
-        // YOU run the tool
-        const toolResult = await runTool(toolUseBlock.name, toolUseBlock.input);
-
-        // notify frontend a goal was saved
         if (toolUseBlock.name === "save_goal") {
           res.write(`data: ${JSON.stringify({ goalSaved: toolUseBlock.input.goal })}\n\n`);
         }
 
-        // add Claude's tool_use + your tool_result to messages
         currentMessages = [
           ...currentMessages,
           { role: "assistant", content: data.content },
@@ -153,16 +226,12 @@ app.post("/chat", async (req, res) => {
             }]
           }
         ];
-
-        // loop again — Claude will now reply to user
         continue;
       }
 
-      // no tool call — Claude is replying with text
       const textBlock = data.content.find(b => b.type === "text");
       if (textBlock) {
         finalReply = textBlock.text;
-        // stream it word by word so UI still feels live
         const words = finalReply.split(" ");
         for (const word of words) {
           res.write(`data: ${JSON.stringify({ token: word + " " })}\n\n`);
@@ -172,10 +241,10 @@ app.post("/chat", async (req, res) => {
       break;
     }
 
-    // save checkin
     const lastUserMsg = messages[messages.length - 1].content;
     await checkinsCollection.insertOne({
       entry: `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${finalReply.slice(0, 80)}...`,
+      userId,
       createdAt: new Date()
     });
 
@@ -189,22 +258,18 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// Save goals endpoint (still works for the + Add Goal button)
-app.post("/goals", async (req, res) => {
-  await goalsCollection.deleteMany({});
-  const goalDocs = req.body.goals.map(goal => ({
-    goal,
-    createdAt: new Date()
-  }));
-  if (goalDocs.length > 0) {
-    await goalsCollection.insertMany(goalDocs);
-  }
+// Goals endpoints — protected
+app.post("/goals", requireAuth, async (req, res) => {
+  const userId = req.user.googleId;
+  await goalsCollection.deleteMany({ userId });
+  const goalDocs = req.body.goals.map(goal => ({ goal, userId, createdAt: new Date() }));
+  if (goalDocs.length > 0) await goalsCollection.insertMany(goalDocs);
   res.json({ success: true });
 });
 
-// Get goals endpoint
-app.get("/goals", async (req, res) => {
-  const goals = await goalsCollection.find().toArray();
+app.get("/goals", requireAuth, async (req, res) => {
+  const userId = req.user.googleId;
+  const goals = await goalsCollection.find({ userId }).toArray();
   res.json({ goals: goals.map(g => g.goal) });
 });
 
