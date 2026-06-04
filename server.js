@@ -38,9 +38,6 @@ async function connectDB() {
   console.log("MongoDB connected ✅");
 }
 
-const nodemailer = require("nodemailer");
-const cron = require("node-cron");
-
 // email transporter
 const transporter = nodemailer.createTransport({
   service: "gmail",
