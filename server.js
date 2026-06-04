@@ -3,6 +3,8 @@ const { MongoClient } = require("mongodb");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
+const nodemailer = require("nodemailer");
+const cron = require("node-cron");
 require("dotenv").config();
 
 const app = express();
@@ -36,6 +38,65 @@ async function connectDB() {
   console.log("MongoDB connected ✅");
 }
 
+const nodemailer = require("nodemailer");
+const cron = require("node-cron");
+
+// email transporter
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.GMAIL_ID,
+    pass: process.env.GMAIL_PASSWORD
+  }
+});
+
+// daily reminder — runs every day at 8pm IST (14:30 UTC)
+cron.schedule("30 14 * * *", async () => {
+  console.log("Running daily reminder check...");
+  try {
+    const users = await usersCollection.find({}).toArray();
+    const today = new Date().toLocaleDateString();
+
+    for (const user of users) {
+      // check if user has checked in today
+      const todayCheckin = await checkinsCollection.findOne({
+        userId: user.googleId,
+        entry: { $regex: today }
+      });
+
+      if (!todayCheckin) {
+        // no checkin today — get their goals
+        const goals = await goalsCollection
+          .find({ userId: user.googleId }).toArray();
+
+        if (goals.length === 0) continue; // skip users with no goals
+
+        const goalList = goals.map((g, i) => `${i+1}. ${g.goal}`).join("\n");
+
+        await transporter.sendMail({
+          from: `"DoIt Coach" <${process.env.GMAIL_ID}>`,
+          to: user.email,
+          subject: "DoIt Coach — daily check-in 👋",
+          text: `Hey ${user.name.split(" ")[0]},
+
+You haven't checked in today. Your coach is waiting.
+
+Your goals:
+${goalList}
+
+How did it go? Come back and tell your coach:
+https://dit-coach.onrender.com
+
+— DoIt Coach`
+        });
+
+        console.log(`Reminder sent to ${user.email}`);
+      }
+    }
+  } catch (err) {
+    console.error("Reminder error:", err);
+  }
+});
 // Google OAuth strategy
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
