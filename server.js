@@ -147,7 +147,7 @@ ${checkins.length > 0 ? checkins.map(c => c.entry).reverse().join("\n") : "No ch
 const tools = [
   {
     name: "save_goal",
-    description: "Save a new goal the user wants to achieve. Call this when the user clearly states a goal or something they want to work toward consistently.",
+    description: "Save a new goal ONLY when the user explicitly states a specific habit or goal they want to commit to long-term. Do NOT call this for general conversation, check-ins, or updates about existing goals. Only call when the user is setting a NEW goal for the first time.",
     input_schema: {
       type: "object",
       properties: {
