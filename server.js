@@ -7,7 +7,6 @@ const { Resend } = require("resend");
 const cron = require("node-cron");
 require("dotenv").config();
 
-
 const app = express();
 app.use(express.json());
 app.use(express.static("public"));
