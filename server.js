@@ -3,6 +3,7 @@ const { MongoClient } = require("mongodb");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
+const MongoStore = require("connect-mongo");
 const { Resend } = require("resend");
 const cron = require("node-cron");
 require("dotenv").config();
@@ -15,6 +16,11 @@ app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
+  store: MongoStore.create({
+    mongoUrl: process.env.MONGODB_URI,
+    dbName: "doitcoach",
+    collectionName: "sessions"
+  }),
   cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
@@ -25,7 +31,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const resend = new Resend(process.env.RESEND_API_KEY);
 console.log("API Key loaded:", ANTHROPIC_API_KEY ? "✅ Yes" : "❌ Missing");
 
-let db, goalsCollection, checkinsCollection, usersCollection;
+let db, goalsCollection, checkinsCollection, usersCollection, messagesCollection;
 
 async function connectDB() {
   const mongoClient = new MongoClient(process.env.MONGODB_URI);
@@ -34,7 +40,23 @@ async function connectDB() {
   goalsCollection = db.collection("goals");
   checkinsCollection = db.collection("checkins");
   usersCollection = db.collection("users");
+  messagesCollection = db.collection("messages");
+  // one document per user, holding their full running message array
+  await messagesCollection.createIndex({ userId: 1 }, { unique: true });
   console.log("MongoDB connected ✅");
+}
+
+async function getHistory(userId) {
+  const doc = await messagesCollection.findOne({ userId });
+  return doc ? doc.messages : [];
+}
+
+async function appendToHistory(userId, newMessages) {
+  await messagesCollection.updateOne(
+    { userId },
+    { $push: { messages: { $each: newMessages } }, $setOnInsert: { userId } },
+    { upsert: true }
+  );
 }
 
 async function sendReminderEmail(user, goalList) {
@@ -203,7 +225,10 @@ async function runTool(toolName, toolInput, userId) {
   return "Tool not found";
 }
 
-async function callClaude(messages, userId) {
+// Streams real Claude output via SSE. Returns the assistant's finished
+// content blocks (text + any tool_use) once the stream completes, so the
+// caller can decide whether to loop again for a tool_result turn.
+async function streamClaudeTurn(messages, userId, res) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -216,14 +241,71 @@ async function callClaude(messages, userId) {
       max_tokens: 200,
       system: await getSystemPrompt(userId),
       messages,
-      tools
+      tools,
+      stream: true
     })
   });
-  return await response.json();
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Claude API error: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  // Content blocks assembled as they stream in, indexed by their position.
+  const blocks = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop();
+
+    for (const evt of events) {
+      const line = evt.split("\n").find(l => l.startsWith("data:"));
+      if (!line) continue;
+      const payload = line.replace("data:", "").trim();
+      if (!payload) continue;
+
+      let msg;
+      try { msg = JSON.parse(payload); } catch { continue; }
+
+      if (msg.type === "content_block_start") {
+        blocks[msg.index] = msg.content_block.type === "tool_use"
+          ? { type: "tool_use", id: msg.content_block.id, name: msg.content_block.name, inputJson: "" }
+          : { type: "text", text: "" };
+      }
+
+      if (msg.type === "content_block_delta") {
+        const block = blocks[msg.index];
+        if (msg.delta.type === "text_delta") {
+          block.text += msg.delta.text;
+          // real token-by-token forwarding to the client, no artificial delay
+          res.write(`data: ${JSON.stringify({ token: msg.delta.text })}\n\n`);
+        } else if (msg.delta.type === "input_json_delta") {
+          block.inputJson += msg.delta.partial_json;
+        }
+      }
+    }
+  }
+
+  // finalize tool_use inputs from accumulated JSON
+  return blocks.map(b => {
+    if (b.type === "tool_use") {
+      return { type: "tool_use", id: b.id, name: b.name, input: JSON.parse(b.inputJson || "{}") };
+    }
+    return { type: "text", text: b.text };
+  });
 }
 
+const MAX_TOOL_ITERATIONS = 5;
+
 app.post("/chat", requireAuth, async (req, res) => {
-  const { messages } = req.body;
+  const { message } = req.body; // client now sends only the new user turn
   const userId = req.user.googleId;
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -231,12 +313,16 @@ app.post("/chat", requireAuth, async (req, res) => {
   res.setHeader("Connection", "keep-alive");
 
   try {
-    let currentMessages = [...messages];
+    const history = await getHistory(userId);
+    const userTurn = { role: "user", content: message };
+    let currentMessages = [...history, userTurn];
     let finalReply = "";
+    let iterations = 0;
 
-    while (true) {
-      const data = await callClaude(currentMessages, userId);
-      const toolUseBlock = data.content.find(b => b.type === "tool_use");
+    while (iterations < MAX_TOOL_ITERATIONS) {
+      iterations++;
+      const contentBlocks = await streamClaudeTurn(currentMessages, userId, res);
+      const toolUseBlock = contentBlocks.find(b => b.type === "tool_use");
 
       if (toolUseBlock) {
         const toolResult = await runTool(toolUseBlock.name, toolUseBlock.input, userId);
@@ -245,27 +331,27 @@ app.post("/chat", requireAuth, async (req, res) => {
         }
         currentMessages = [
           ...currentMessages,
-          { role: "assistant", content: data.content },
+          { role: "assistant", content: contentBlocks },
           { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseBlock.id, content: toolResult }] }
         ];
         continue;
       }
 
-      const textBlock = data.content.find(b => b.type === "text");
-      if (textBlock) {
-        finalReply = textBlock.text;
-        const words = finalReply.split(" ");
-        for (const word of words) {
-          res.write(`data: ${JSON.stringify({ token: word + " " })}\n\n`);
-          await new Promise(r => setTimeout(r, 30));
-        }
-      }
+      const textBlock = contentBlocks.find(b => b.type === "text");
+      finalReply = textBlock ? textBlock.text : "";
+      // persist the full turn (user message + final assistant reply) once we're done
+      await appendToHistory(userId, [userTurn, { role: "assistant", content: finalReply }]);
       break;
     }
 
-    const lastUserMsg = messages[messages.length - 1].content;
+    if (iterations >= MAX_TOOL_ITERATIONS && !finalReply) {
+      finalReply = "Sorry, I got stuck processing that. Try rephrasing?";
+      res.write(`data: ${JSON.stringify({ token: finalReply })}\n\n`);
+      await appendToHistory(userId, [userTurn, { role: "assistant", content: finalReply }]);
+    }
+
     await checkinsCollection.insertOne({
-      entry: `[${new Date().toLocaleDateString()}] User: ${lastUserMsg} | Coach: ${finalReply.slice(0, 80)}...`,
+      entry: `[${new Date().toLocaleDateString()}] User: ${message} | Coach: ${finalReply.slice(0, 80)}...`,
       userId,
       createdAt: new Date()
     });
@@ -278,6 +364,12 @@ app.post("/chat", requireAuth, async (req, res) => {
     res.write(`data: ${JSON.stringify({ error: "Something went wrong." })}\n\n`);
     res.end();
   }
+});
+
+// lets the frontend rehydrate the chat window on page load / refresh
+app.get("/chat/history", requireAuth, async (req, res) => {
+  const history = await getHistory(req.user.googleId);
+  res.json({ messages: history });
 });
 
 app.post("/goals", requireAuth, async (req, res) => {

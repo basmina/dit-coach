@@ -73,7 +73,6 @@ if (inputArea) inputArea.style.display = "none";
   // logged in — show user name
   document.querySelector("header span").textContent = `Hi ${authData.user.name.split(" ")[0]} 👋`;
   document.getElementById("user-area").style.display = "block";
-  addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
 
   // load saved goals from MongoDB
   try {
@@ -84,6 +83,23 @@ if (inputArea) inputArea.style.display = "none";
       renderGoals();
     }
   } catch (_) {}
+
+  // rehydrate conversation history from MongoDB so a refresh doesn't lose it
+  try {
+    const histRes = await fetch("/chat/history");
+    const histData = await histRes.json();
+    if (histData.messages && histData.messages.length > 0) {
+      messages = histData.messages;
+      for (const m of messages) {
+        const text = typeof m.content === "string" ? m.content : "";
+        if (text) addMessage(m.role === "user" ? "user" : "coach", text);
+      }
+    } else {
+      addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
+    }
+  } catch (_) {
+    addMessage("coach", "Hey! I'm DoIt, your accountability coach. 👋\n\nFirst — what's one thing you *know* you should be doing but keep putting off?\n\nAdd it as a goal above, then let's talk.");
+  }
 };
 
   function renderGoals() {
@@ -134,7 +150,7 @@ async function sendMessage() {
     const res = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages })
+      body: JSON.stringify({ message: text }) // server loads history itself now
     });
 
     typing.remove();
@@ -190,4 +206,4 @@ async function sendMessage() {
 }
 </script>
 </body>
-</html> 
+</html>
